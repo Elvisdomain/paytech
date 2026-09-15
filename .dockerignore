@@ -1,0 +1,36 @@
+# Dependencies — never copy local node_modules into the image
+**/node_modules
+
+# Build artifacts
+**/dist
+**/.next
+**/*.log
+
+# Git
+.git
+.gitignore
+
+# Editor / OS
+.vscode
+.idea
+*.swp
+.DS_Store
+Thumbs.db
+
+# Environment files — secrets must come from Secret Manager / Parameter Store at runtime
+**/.env
+**/.env.*
+!**/.env.example
+
+# Test / coverage
+**/coverage
+**/__tests__
+**/*.test.js
+**/*.spec.js
+
+# CI config (not needed inside images)
+cloudbuild.yaml
+buildspec.yml
+
+# Docs
+README.md

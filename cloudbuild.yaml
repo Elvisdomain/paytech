@@ -1,0 +1,297 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GCP Cloud Build — PayTech
+#
+# What this does:
+#   1. Builds all 7 service images in parallel
+#   2. Pushes them to Artifact Registry
+#   3. Deploys each service to Cloud Run
+#   4. Runs DB migrations via Cloud Run Jobs (one-off)
+#
+# Prerequisites:
+#   gcloud projects add-iam-policy-binding $PROJECT_ID \
+#     --member="serviceAccount:$BUILD_SA" \
+#     --role="roles/run.admin"
+#   gcloud projects add-iam-policy-binding $PROJECT_ID \
+#     --member="serviceAccount:$BUILD_SA" \
+#     --role="roles/artifactregistry.writer"
+#
+# Substitutions (set in Cloud Build trigger or pass with --substitutions):
+#   _REGION          e.g. europe-west1
+#   _REGISTRY        e.g. europe-west1-docker.pkg.dev/$PROJECT_ID/paytech
+#   _CLOUDSQL_CONN   e.g. my-project:europe-west1:paytech-pg
+#   _RUN_SA          Service account email for Cloud Run services
+# ─────────────────────────────────────────────────────────────────────────────
+
+substitutions:
+  _REGION:       europe-west1
+  _REGISTRY:     europe-west1-docker.pkg.dev/$PROJECT_ID/paytech
+  _CLOUDSQL_CONN: "" # e.g. my-project:europe-west1:paytech-pg
+  _RUN_SA:       "" # e.g. paytech-run@my-project.iam.gserviceaccount.com
+
+options:
+  machineType: E2_HIGHCPU_8   # parallel builds benefit from more CPUs
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+
+  # ── 1. Build all images in parallel ────────────────────────────────────────
+  - id: build-api-gateway
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f services/api-gateway/Dockerfile
+      - -t $_REGISTRY/api-gateway:$COMMIT_SHA
+      - -t $_REGISTRY/api-gateway:latest
+      - .
+    waitFor: ["-"]   # start immediately (parallel)
+
+  - id: build-user-service
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f services/user-service/Dockerfile
+      - -t $_REGISTRY/user-service:$COMMIT_SHA
+      - -t $_REGISTRY/user-service:latest
+      - .
+    waitFor: ["-"]
+
+  - id: build-payment-service
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f services/payment-service/Dockerfile
+      - -t $_REGISTRY/payment-service:$COMMIT_SHA
+      - -t $_REGISTRY/payment-service:latest
+      - .
+    waitFor: ["-"]
+
+  - id: build-order-service
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f services/order-service/Dockerfile
+      - -t $_REGISTRY/order-service:$COMMIT_SHA
+      - -t $_REGISTRY/order-service:latest
+      - .
+    waitFor: ["-"]
+
+  - id: build-notification-service
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f services/notification-service/Dockerfile
+      - -t $_REGISTRY/notification-service:$COMMIT_SHA
+      - -t $_REGISTRY/notification-service:latest
+      - .
+    waitFor: ["-"]
+
+  - id: build-fraud-service
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f services/fraud-service/Dockerfile
+      - -t $_REGISTRY/fraud-service:$COMMIT_SHA
+      - -t $_REGISTRY/fraud-service:latest
+      - .
+    waitFor: ["-"]
+
+  - id: build-ledger-service
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f services/ledger-service/Dockerfile
+      - -t $_REGISTRY/ledger-service:$COMMIT_SHA
+      - -t $_REGISTRY/ledger-service:latest
+      - .
+    waitFor: ["-"]
+
+  # ── 2. Push all images ──────────────────────────────────────────────────────
+  - id: push-images
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        for svc in api-gateway user-service payment-service order-service \
+                   notification-service fraud-service ledger-service; do
+          docker push $_REGISTRY/$svc:$COMMIT_SHA
+          docker push $_REGISTRY/$svc:latest
+        done
+    waitFor:
+      - build-api-gateway
+      - build-user-service
+      - build-payment-service
+      - build-order-service
+      - build-notification-service
+      - build-fraud-service
+      - build-ledger-service
+
+  # ── 3. Run DB migrations via a one-off Cloud Run Job ───────────────────────
+  # Uses the user-service image which has access to all SQL migrations.
+  # Migrations are idempotent (IF NOT EXISTS) so safe to re-run on every deploy.
+  - id: run-migrations
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud run jobs create paytech-migrate-$SHORT_SHA \
+          --image=$_REGISTRY/user-service:$COMMIT_SHA \
+          --region=$_REGION \
+          --service-account=$_RUN_SA \
+          --add-cloudsql-instances=$_CLOUDSQL_CONN \
+          --set-secrets=POSTGRES_PASSWORD=paytech-db-password:latest \
+          --set-env-vars=POSTGRES_HOST=/cloudsql/$_CLOUDSQL_CONN,POSTGRES_DB=paytech,POSTGRES_USER=paytech \
+          --command="node" \
+          --args="-e,require('./src/migrate')" \
+          --max-retries=1 \
+          --task-timeout=120s \
+          --execute-now \
+          --wait \
+          --project=$PROJECT_ID
+    waitFor: [push-images]
+
+  # ── 4. Deploy services to Cloud Run (parallel) ─────────────────────────────
+  - id: deploy-user-service
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run deploy user-service
+      - --image=$_REGISTRY/user-service:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=$_RUN_SA
+      - --add-cloudsql-instances=$_CLOUDSQL_CONN
+      - --set-secrets=POSTGRES_PASSWORD=paytech-db-password:latest
+      - --set-env-vars=POSTGRES_HOST=/cloudsql/$_CLOUDSQL_CONN,POSTGRES_DB=paytech,POSTGRES_USER=paytech,PORT=3001
+      - --project=$PROJECT_ID
+    waitFor: [run-migrations]
+
+  - id: deploy-fraud-service
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run deploy fraud-service
+      - --image=$_REGISTRY/fraud-service:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=$_RUN_SA
+      - --set-env-vars=PORT=3005
+      - --project=$PROJECT_ID
+    waitFor: [run-migrations]
+
+  - id: deploy-ledger-service
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run deploy ledger-service
+      - --image=$_REGISTRY/ledger-service:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=$_RUN_SA
+      - --add-cloudsql-instances=$_CLOUDSQL_CONN
+      - --set-secrets=POSTGRES_PASSWORD=paytech-db-password:latest
+      - --set-env-vars=POSTGRES_HOST=/cloudsql/$_CLOUDSQL_CONN,POSTGRES_DB=paytech,POSTGRES_USER=paytech,PORT=3006
+      - --project=$PROJECT_ID
+    waitFor: [run-migrations]
+
+  - id: deploy-order-service
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run deploy order-service
+      - --image=$_REGISTRY/order-service:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=$_RUN_SA
+      - --add-cloudsql-instances=$_CLOUDSQL_CONN
+      - --set-secrets=POSTGRES_PASSWORD=paytech-db-password:latest,RABBITMQ_URL=paytech-rabbitmq-url:latest
+      - --set-env-vars=POSTGRES_HOST=/cloudsql/$_CLOUDSQL_CONN,POSTGRES_DB=paytech,POSTGRES_USER=paytech,PORT=3003
+      - --project=$PROJECT_ID
+    waitFor: [run-migrations]
+
+  - id: deploy-notification-service
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run deploy notification-service
+      - --image=$_REGISTRY/notification-service:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=$_RUN_SA
+      - --add-cloudsql-instances=$_CLOUDSQL_CONN
+      - --set-secrets=POSTGRES_PASSWORD=paytech-db-password:latest,RABBITMQ_URL=paytech-rabbitmq-url:latest
+      - --set-env-vars=POSTGRES_HOST=/cloudsql/$_CLOUDSQL_CONN,POSTGRES_DB=paytech,POSTGRES_USER=paytech,PORT=3004,SIMULATE_SEND_FAILURE=0
+      - --project=$PROJECT_ID
+    waitFor: [run-migrations]
+
+  - id: deploy-payment-service
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run deploy payment-service
+      - --image=$_REGISTRY/payment-service:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=$_RUN_SA
+      - --add-cloudsql-instances=$_CLOUDSQL_CONN
+      - --set-secrets=POSTGRES_PASSWORD=paytech-db-password:latest,RABBITMQ_URL=paytech-rabbitmq-url:latest
+      - --set-env-vars=POSTGRES_HOST=/cloudsql/$_CLOUDSQL_CONN,POSTGRES_DB=paytech,POSTGRES_USER=paytech,PORT=3002,FRAUD_FAIL_OPEN=false
+      - --project=$PROJECT_ID
+    waitFor:
+      - deploy-fraud-service
+      - deploy-ledger-service
+
+  # api-gateway deployed last — it depends on all upstream service URLs
+  - id: deploy-api-gateway
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        USER_URL=$(gcloud run services describe user-service \
+          --region=$_REGION --project=$PROJECT_ID \
+          --format='value(status.url)')
+        PAYMENT_URL=$(gcloud run services describe payment-service \
+          --region=$_REGION --project=$PROJECT_ID \
+          --format='value(status.url)')
+        ORDER_URL=$(gcloud run services describe order-service \
+          --region=$_REGION --project=$PROJECT_ID \
+          --format='value(status.url)')
+        NOTIFICATION_URL=$(gcloud run services describe notification-service \
+          --region=$_REGION --project=$PROJECT_ID \
+          --format='value(status.url)')
+
+        gcloud run deploy api-gateway \
+          --image=$_REGISTRY/api-gateway:$COMMIT_SHA \
+          --region=$_REGION \
+          --platform=managed \
+          --allow-unauthenticated \
+          --service-account=$_RUN_SA \
+          --set-secrets=VALID_API_KEYS=paytech-api-keys:latest \
+          --set-env-vars="PORT=3000,\
+        USER_SERVICE_URL=$USER_URL,\
+        PAYMENT_SERVICE_URL=$PAYMENT_URL,\
+        ORDER_SERVICE_URL=$ORDER_URL,\
+        NOTIFICATION_SERVICE_URL=$NOTIFICATION_URL" \
+          --project=$PROJECT_ID
+    waitFor:
+      - deploy-user-service
+      - deploy-payment-service
+      - deploy-order-service
+      - deploy-notification-service
+
+images:
+  - $_REGISTRY/api-gateway:$COMMIT_SHA
+  - $_REGISTRY/user-service:$COMMIT_SHA
+  - $_REGISTRY/payment-service:$COMMIT_SHA
+  - $_REGISTRY/order-service:$COMMIT_SHA
+  - $_REGISTRY/notification-service:$COMMIT_SHA
+  - $_REGISTRY/fraud-service:$COMMIT_SHA
+  - $_REGISTRY/ledger-service:$COMMIT_SHA

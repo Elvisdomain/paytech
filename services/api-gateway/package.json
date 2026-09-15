@@ -1,0 +1,16 @@
+{
+  "name": "api-gateway",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev":   "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@paytech/shared": "file:../../shared",
+    "express":         "4.19.2",
+    "express-rate-limit": "7.3.1",
+    "http-proxy-middleware": "3.0.0",
+    "uuid":            "10.0.0"
+  }
+}
