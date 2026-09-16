@@ -58,8 +58,9 @@ API Gateway
 ```
 paytech/
 ├── .dockerignore
-├── cloudbuild.yaml               # GCP Cloud Build CI/CD
-├── buildspec.yml                 # AWS CodeBuild CI/CD
+├── .github/
+│   └── workflows/
+│       └── build-push.yml        # CI/CD → GCP Artifact Registry
 ├── infra/
 │   └── postgres/
 │       ├── migrate.js            # Standalone migration runner (cloud one-off task)
@@ -91,43 +92,159 @@ paytech/
 
 Each service contains:
 - `src/` — application source
-- `Dockerfile` — multi-stage build, build context is repo root
+- `Dockerfile` — build context is repo root
 - `.env.example` — all required environment variables documented
+
+---
+
+## GitHub Actions — CI/CD to Artifact Registry
+
+The workflow at `.github/workflows/build-push.yml` builds all 7 service images in parallel and pushes them to GCP Artifact Registry on every merge to `main`.
+
+### What it does
+
+```
+push to main
+  └── matrix build (7 jobs, parallel)
+        ├── Authenticate to GCP (Workload Identity Federation — no JSON keys)
+        ├── docker build -f services/<service>/Dockerfile .
+        ├── push :<short-sha>   ← pin this in your k8s manifests
+        └── push :latest
+
+pull_request
+  └── matrix build (build only, no push — verifies the Dockerfile compiles)
+```
+
+Image tags produced for commit `a1b2c3d4`:
+```
+us-east1-docker.pkg.dev/<project>/paytech/api-gateway:a1b2c3d4
+us-east1-docker.pkg.dev/<project>/paytech/api-gateway:latest
+# ... same for all 7 services
+```
+
+### Required GitHub secrets and variables
+
+Go to **Settings → Secrets and variables → Actions** in your repository.
+
+| Type | Name | Value |
+|------|------|-------|
+| Secret | `GCP_WIF_PROVIDER` | Workload Identity Provider resource name (see setup below) |
+| Secret | `GCP_WIF_SA` | Service account email that WIF impersonates |
+| Variable | `GCP_PROJECT_ID` | Your GCP project id |
+
+### One-time GCP setup
+
+Run these once before your first push.
+
+```bash
+export PROJECT_ID=clear-shadow-508714-b2
+export REGION=us-east1
+export GITHUB_ORG=Elvisdomain
+export GITHUB_REPO=paytech
+
+# 1. Enable required APIs
+gcloud services enable \
+  artifactregistry.googleapis.com \
+  iamcredentials.googleapis.com \
+  --project=$PROJECT_ID
+
+# 2. Create Artifact Registry repository
+gcloud artifacts repositories create paytech \
+  --repository-format=docker \
+  --location=$REGION \
+  --project=$PROJECT_ID
+
+# 3. Create a dedicated service account for GitHub Actions
+gcloud iam service-accounts create github-actions \
+  --display-name="GitHub Actions — PayTech" \
+  --project=$PROJECT_ID
+
+# 4. Grant it permission to push images
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:github-actions@$PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.writer"
+
+# 5. Create a Workload Identity Pool
+gcloud iam workload-identity-pools create github \
+  --location=global \
+  --display-name="GitHub Actions pool" \
+  --project=$PROJECT_ID
+
+# 6. Create a provider inside the pool
+gcloud iam workload-identity-pools providers create-oidc github-provider \
+  --location=global \
+  --workload-identity-pool=github \
+  --display-name="GitHub provider" \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
+  --attribute-condition="assertion.repository=='$GITHUB_ORG/$GITHUB_REPO'" \
+  --project=$PROJECT_ID
+
+# 7. Allow the WIF provider to impersonate the service account
+POOL_ID=$(gcloud iam workload-identity-pools describe github \
+  --location=global \
+  --project=$PROJECT_ID \
+  --format="value(name)")
+
+gcloud iam service-accounts add-iam-policy-binding \
+  github-actions@$PROJECT_ID.iam.gserviceaccount.com \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/$POOL_ID/attribute.repository/$GITHUB_ORG/$GITHUB_REPO" \
+  --project=$PROJECT_ID
+
+# 8. Get the values to paste into GitHub Secrets
+echo "--- GCP_WIF_PROVIDER ---"
+gcloud iam workload-identity-pools providers describe github-provider \
+  --location=global \
+  --workload-identity-pool=github \
+  --project=$PROJECT_ID \
+  --format="value(name)"
+
+echo "--- GCP_WIF_SA ---"
+echo "github-actions@$PROJECT_ID.iam.gserviceaccount.com"
+```
+
+Paste the output of step 8 into GitHub → Settings → Secrets and variables → Actions.
+
+### Referencing images in Kubernetes
+
+After a successful build, every image is tagged with the short commit SHA. Use the SHA tag — not `:latest` — in your manifests so deployments are deterministic and rollbacks are a single `kubectl apply`:
+
+```yaml
+# Example deployment.yaml
+containers:
+  - name: api-gateway
+    image: us-east1-docker.pkg.dev/<project>/paytech/api-gateway:a1b2c3d4
+```
+
+The Actions **summary tab** on each run lists all 7 image refs ready to copy.
 
 ---
 
 ## Deploying to GCP
 
-### Managed services used
+### Managed services
 
 | Concern | GCP service |
 |---------|-------------|
-| Container runtime | Cloud Run |
+| Container runtime | GKE or Cloud Run |
 | Database | Cloud SQL (PostgreSQL 16) |
-| Message broker | CloudAMQP (managed RabbitMQ) or Google Cloud Pub/Sub |
+| Message broker | CloudAMQP (managed RabbitMQ) |
 | Container registry | Artifact Registry |
 | Secrets | Secret Manager |
-| CI/CD | Cloud Build (`cloudbuild.yaml`) |
 
-### One-time setup
+### One-time infrastructure setup
 
 ```bash
-export PROJECT_ID=your-project-id
-export REGION=europe-west1
+export PROJECT_ID=clear-shadow-508714-b2
+export REGION=us-east1
 
 # Enable required APIs
 gcloud services enable \
-  run.googleapis.com \
+  container.googleapis.com \
   sqladmin.googleapis.com \
   artifactregistry.googleapis.com \
-  cloudbuild.googleapis.com \
   secretmanager.googleapis.com \
-  --project=$PROJECT_ID
-
-# Create Artifact Registry repository
-gcloud artifacts repositories create paytech \
-  --repository-format=docker \
-  --location=$REGION \
   --project=$PROJECT_ID
 
 # Create Cloud SQL instance (PostgreSQL 16)
@@ -146,7 +263,7 @@ gcloud sql users create paytech \
   --password=<strong-password> \
   --project=$PROJECT_ID
 
-# Store secrets
+# Store secrets in Secret Manager
 echo -n "<strong-password>" | \
   gcloud secrets create paytech-db-password \
     --data-file=- --project=$PROJECT_ID
@@ -159,192 +276,56 @@ echo -n "key-one,key-two" | \
   gcloud secrets create paytech-api-keys \
     --data-file=- --project=$PROJECT_ID
 
-# Create a dedicated service account for Cloud Run services
-gcloud iam service-accounts create paytech-run \
-  --display-name="PayTech Cloud Run SA" \
+# Create a service account for the workloads
+gcloud iam service-accounts create paytech-workload \
+  --display-name="PayTech Workload SA" \
   --project=$PROJECT_ID
 
-# Grant it access to Cloud SQL, Secret Manager, and Artifact Registry
 for role in \
   roles/cloudsql.client \
   roles/secretmanager.secretAccessor \
   roles/artifactregistry.reader; do
   gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:paytech-run@$PROJECT_ID.iam.gserviceaccount.com" \
+    --member="serviceAccount:paytech-workload@$PROJECT_ID.iam.gserviceaccount.com" \
     --role="$role"
 done
 ```
 
-### Connect Cloud Build trigger
+### Run migrations
+
+Migrations must be run once after the database is provisioned, and again after any new migration file is added. The runner connects directly to Cloud SQL:
 
 ```bash
-# Grant Cloud Build permission to deploy Cloud Run and read secrets
-for role in \
-  roles/run.admin \
-  roles/iam.serviceAccountUser \
-  roles/artifactregistry.writer \
-  roles/secretmanager.secretAccessor; do
-  gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:$(gcloud projects describe $PROJECT_ID \
-      --format='value(projectNumber)')@cloudbuild.gserviceaccount.com" \
-    --role="$role"
-done
-
-# Create trigger pointing at your repo
-gcloud builds triggers create github \
-  --repo-name=paytech \
-  --repo-owner=<your-github-org> \
-  --branch-pattern="^main$" \
-  --build-config=cloudbuild.yaml \
-  --substitutions=\
-_REGION=$REGION,\
-_REGISTRY=$REGION-docker.pkg.dev/$PROJECT_ID/paytech,\
-_CLOUDSQL_CONN=$PROJECT_ID:$REGION:paytech-pg,\
-_RUN_SA=paytech-run@$PROJECT_ID.iam.gserviceaccount.com \
-  --project=$PROJECT_ID
+# From a machine with Cloud SQL Auth Proxy or inside a Cloud Run Job
+node infra/postgres/migrate.js
 ```
 
-### Run migrations manually (first deploy)
-
-```bash
-gcloud run jobs create paytech-migrate \
-  --image=$REGION-docker.pkg.dev/$PROJECT_ID/paytech/user-service:latest \
-  --region=$REGION \
-  --service-account=paytech-run@$PROJECT_ID.iam.gserviceaccount.com \
-  --add-cloudsql-instances=$PROJECT_ID:$REGION:paytech-pg \
-  --set-secrets=POSTGRES_PASSWORD=paytech-db-password:latest \
-  --set-env-vars="POSTGRES_HOST=/cloudsql/$PROJECT_ID:$REGION:paytech-pg,\
-POSTGRES_DB=paytech,POSTGRES_USER=paytech" \
-  --command=node \
-  --args="infra/postgres/migrate.js" \
-  --execute-now \
-  --wait \
-  --project=$PROJECT_ID
+Required environment variables:
+```
+POSTGRES_HOST=/cloudsql/<project>:<region>:<instance>   # Cloud SQL socket
+POSTGRES_DB=paytech
+POSTGRES_USER=paytech
+POSTGRES_PASSWORD=<from Secret Manager>
 ```
 
 ### POSTGRES_HOST for Cloud SQL
 
-Cloud Run connects to Cloud SQL via a Unix socket. Set:
+Cloud SQL uses a Unix socket via the Cloud SQL Auth Proxy (built into Cloud Run, or run as a sidecar in GKE):
 ```
-POSTGRES_HOST=/cloudsql/<project>:<region>:<instance>
+POSTGRES_HOST=/cloudsql/clear-shadow-508714-b2:us-east1:paytech-pg
 ```
-The Cloud SQL Auth Proxy is built into Cloud Run — no sidecar needed.
-
----
-
-## Deploying to AWS
-
-### Managed services used
-
-| Concern | AWS service |
-|---------|-------------|
-| Container runtime | ECS Fargate |
-| Database | RDS PostgreSQL 16 |
-| Message broker | Amazon MQ (RabbitMQ) |
-| Container registry | ECR |
-| Secrets | SSM Parameter Store (SecureString) |
-| CI/CD | CodeBuild (`buildspec.yml`) |
-
-### One-time setup
-
-```bash
-export AWS_REGION=eu-west-1
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export ECR_BASE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/paytech
-
-# Create ECR repositories
-for svc in api-gateway user-service payment-service order-service \
-           notification-service fraud-service ledger-service; do
-  aws ecr create-repository --repository-name paytech/$svc --region $AWS_REGION
-done
-
-# Create RDS PostgreSQL instance
-aws rds create-db-instance \
-  --db-instance-identifier paytech-pg \
-  --db-instance-class db.t3.micro \
-  --engine postgres \
-  --engine-version 16 \
-  --master-username paytech \
-  --master-user-password <strong-password> \
-  --db-name paytech \
-  --allocated-storage 20 \
-  --no-publicly-accessible \
-  --region $AWS_REGION
-
-# Create Amazon MQ RabbitMQ broker
-aws mq create-broker \
-  --broker-name paytech-rabbit \
-  --engine-type RABBITMQ \
-  --engine-version 3.13 \
-  --host-instance-type mq.m5.large \
-  --deployment-mode SINGLE_INSTANCE \
-  --publicly-accessible \
-  --user Username=paytech,Password=<strong-password> \
-  --region $AWS_REGION
-
-# Store secrets in SSM Parameter Store
-aws ssm put-parameter --name /paytech/db/password \
-  --value "<strong-password>" --type SecureString --region $AWS_REGION
-
-aws ssm put-parameter --name /paytech/rabbitmq/url \
-  --value "amqps://paytech:<pass>@<broker-endpoint>:5671/paytech" \
-  --type SecureString --region $AWS_REGION
-
-aws ssm put-parameter --name /paytech/api/keys \
-  --value "key-one,key-two" --type SecureString --region $AWS_REGION
-```
-
-### ECS cluster and services
-
-Use the AWS CDK, Terraform, or the console to create:
-- ECS cluster: `paytech-cluster`
-- One Fargate service per service: `paytech-<service-name>`
-- Task definitions referencing the ECR images
-- A service-linked IAM role with SSM read access
-
-The `buildspec.yml` then handles updating task definitions and triggering rolling deployments on every push to `main`.
-
-### Run migrations (first deploy)
-
-```bash
-# Build and push the user-service image first, then run:
-aws ecs run-task \
-  --cluster paytech-cluster \
-  --task-definition paytech-migrate \
-  --launch-type FARGATE \
-  --overrides '{
-    "containerOverrides": [{
-      "name": "migrate",
-      "command": ["node", "infra/postgres/migrate.js"]
-    }]
-  }' \
-  --network-configuration "awsvpcConfiguration={
-    subnets=[subnet-xxxx],
-    securityGroups=[sg-xxxx],
-    assignPublicIp=DISABLED
-  }" \
-  --region $AWS_REGION
-```
-
-### POSTGRES_HOST for RDS
-
-Use the RDS endpoint hostname directly:
-```
-POSTGRES_HOST=paytech-pg.xxxxxxxxx.eu-west-1.rds.amazonaws.com
-```
-Ensure the ECS task security group has outbound access to the RDS security group on port 5432.
 
 ---
 
 ## Secrets management
 
-Never put real credentials in environment variables directly or in source control. Both pipelines are wired to pull from the respective secrets store at deploy time.
+Never put real credentials in environment variables directly or in source control. Inject them at runtime from Secret Manager.
 
-| Secret name | GCP Secret Manager | AWS SSM Parameter Store |
-|-------------|-------------------|------------------------|
-| DB password | `paytech-db-password` | `/paytech/db/password` |
-| RabbitMQ URL | `paytech-rabbitmq-url` | `/paytech/rabbitmq/url` |
-| API keys | `paytech-api-keys` | `/paytech/api/keys` |
+| Secret name | Description |
+|-------------|-------------|
+| `paytech-db-password` | Cloud SQL postgres user password |
+| `paytech-rabbitmq-url` | Full AMQPS connection string for CloudAMQP |
+| `paytech-api-keys` | Comma-separated valid API keys for the gateway |
 
 ---
 
@@ -360,7 +341,7 @@ Every service documents its variables in `.env.example`. The full list:
 | `POSTGRES_PORT` | all except fraud | Default `5432` |
 | `POSTGRES_DB` | all except fraud | Default `paytech` |
 | `POSTGRES_USER` | all except fraud | DB user |
-| `POSTGRES_PASSWORD` | all except fraud | Inject from secrets store |
+| `POSTGRES_PASSWORD` | all except fraud | Inject from Secret Manager |
 | `PG_POOL_MAX` | all except fraud | Connection pool size, default `10` |
 | `RABBITMQ_URL` | payment, order, notification | Full AMQP(S) connection string |
 | `FRAUD_SERVICE_URL` | payment | Internal URL of fraud-service |
@@ -425,9 +406,9 @@ The `Idempotency-Key` header is required. The same key always returns the same r
 ### Idempotency (payment-service)
 
 ```
-First request  → INSERT idempotency_keys + run pipeline (atomic)
-Retry request  → SELECT idempotency_keys → return cached response
-Concurrent dup → PK constraint on idempotency_keys serialises both requests
+First request    → INSERT idempotency_keys + run pipeline (atomic)
+Retry request    → SELECT idempotency_keys → return cached response
+Concurrent dup   → PK constraint on idempotency_keys serialises both requests
 Mid-flight crash → transaction rollback, key not stored, safe to retry
 ```
 
